@@ -1,22 +1,30 @@
+"""SMA Momentum Backtester — interface Streamlit.
+
+Ce fichier ne contient que l'interface et l'orchestration. La logique métier
+vit dans les modules :
+- data.py     : chargement des données (yfinance)
+- backtest.py : moteur de backtest, walk-forward, Monte Carlo
+- metrics.py  : métriques globales et par trade
+- plots.py    : graphiques Plotly
+"""
 import streamlit as st
 import pandas as pd
 import numpy as np
-import yfinance as yf
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 from datetime import date
-from scipy import stats
+
+import data
+import plots
+from backtest import run_backtest, walk_forward_analysis, monte_carlo, grid_search
+from metrics import compute_metrics, compute_trade_metrics
 
 st.set_page_config(page_title="SMA Momentum Backtester", layout="wide")
 
-# Style global pour ajouter plus d'espace
 st.markdown("""
 <style>
 div[data-testid="metric-container"] {
     padding: 18px 20px;
     margin-bottom: 8px;
 }
-
 .block-container {
     padding-top: 2rem;
     padding-bottom: 2rem;
@@ -26,6 +34,28 @@ div[data-testid="metric-container"] {
 
 st.title("SMA Momentum Backtester")
 st.caption("Stratégie de trading par croisement de moyennes mobiles simples (golden cross / death cross)")
+
+
+# Le cache Streamlit est appliqué ici (couche interface) plutôt que dans
+# data.py, pour garder le module data réutilisable hors Streamlit.
+@st.cache_data(ttl=3600)
+def load_data(ticker: str, start, end):
+    return data.load_data(ticker, start, end)
+
+
+# Le préfixe _ sur _progress dit à st.cache_data d'ignorer ce paramètre pour
+# le hachage : la barre de progression n'apparaît qu'au premier calcul, les
+# reruns suivants sont servis instantanément depuis le cache.
+@st.cache_data(ttl=3600, show_spinner=False)
+def run_grid_search(df, fast_values, slow_values, capital, fees,
+                    stop_loss, take_profit, _progress=None):
+    return grid_search(df, fast_values, slow_values, capital, fees,
+                       stop_loss, take_profit, progress_callback=_progress)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SIDEBAR — PARAMÈTRES
+# ─────────────────────────────────────────────────────────────────────────────
 
 with st.sidebar:
     st.header("Paramètres")
@@ -61,309 +91,37 @@ with st.sidebar:
         step=0.05
     ) / 100
 
-    run = st.button("Lancer le backtest", type="primary", use_container_width=True)
+    st.divider()
+    st.subheader("🛡️ Gestion du risque")
+
+    use_stop_loss = st.checkbox("Activer Stop-Loss", value=False)
+    stop_loss_pct = None
+    if use_stop_loss:
+        sl_val = st.slider("Stop-Loss (%)", min_value=-30, max_value=-1, value=-10, step=1)
+        stop_loss_pct = sl_val / 100
+        st.caption(f"Position fermée si prix baisse de **{abs(sl_val)}%** depuis l'entrée.")
+
+    use_take_profit = st.checkbox("Activer Take-Profit", value=False)
+    take_profit_pct = None
+    if use_take_profit:
+        tp_val = st.slider("Take-Profit (%)", min_value=1, max_value=100, value=20, step=1)
+        take_profit_pct = tp_val / 100
+        st.caption(f"Position fermée si prix monte de **{tp_val}%** depuis l'entrée.")
+
+    run = st.button("Lancer le backtest", type="primary", width="stretch")
 
 
-@st.cache_data(ttl=3600)
-def load_data(ticker: str, start, end):
-    try:
-        if not ticker:
-            return None, "Le ticker est vide."
+# ─────────────────────────────────────────────────────────────────────────────
+# APPLICATION PRINCIPALE
+# ─────────────────────────────────────────────────────────────────────────────
 
-        start_ts = pd.to_datetime(start)
-        end_ts = pd.to_datetime(end)
-
-        if start_ts >= end_ts:
-            return None, "La date de début doit être antérieure à la date de fin."
-
-        end_ts = end_ts + pd.Timedelta(days=1)
-
-        df = yf.download(
-            ticker,
-            start=start_ts,
-            end=end_ts,
-            progress=False,
-            auto_adjust=True,
-            threads=False
-        )
-
-        if df is None or df.empty:
-            return None, f"Aucune donnée retournée pour {ticker}. Vérifie le ticker, la période, ou réessaie plus tard."
-
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-
-        if "Close" not in df.columns:
-            return None, f"La colonne 'Close' est absente pour {ticker}. Colonnes reçues: {list(df.columns)}"
-
-        df = df[["Close"]].copy()
-        df.columns = ["Close"]
-        df.dropna(inplace=True)
-
-        if df.empty:
-            return None, f"Les données de clôture de {ticker} sont vides après nettoyage."
-
-        return df, None
-
-    except Exception as e:
-        return None, f"Erreur lors du chargement des données pour {ticker}: {e}"
-
-
-def run_backtest(df, short_w, long_w, capital, fees=0.0):
-    df = df.copy()
-    df["SMA_fast"] = df["Close"].rolling(short_w).mean()
-    df["SMA_slow"] = df["Close"].rolling(long_w).mean()
-    df.dropna(inplace=True)
-
-    df["signal"] = np.where(df["SMA_fast"] > df["SMA_slow"], 1, 0)
-    df["position"] = df["signal"].diff().fillna(0)
-
-    cash = float(capital)
-    shares = 0.0
-    portfolio_values = []
-    buy_signals = []
-    sell_signals = []
-    total_fees_paid = 0.0
-
-    for idx, row in df.iterrows():
-        price = float(row["Close"])
-
-        if row["position"] == 1 and cash > 0:
-            fee = cash * fees
-            cash -= fee
-            total_fees_paid += fee
-            shares = cash / price
-            cash = 0.0
-            buy_signals.append((idx, price))
-
-        elif row["position"] == -1 and shares > 0:
-            cash = shares * price
-            fee = cash * fees
-            cash -= fee
-            total_fees_paid += fee
-            shares = 0.0
-            sell_signals.append((idx, price))
-
-        portfolio_values.append(cash + shares * price)
-
-    final_value = cash + shares * float(df["Close"].iloc[-1])
-    df["portfolio"] = portfolio_values
-    df["bh"] = capital * df["Close"] / float(df["Close"].iloc[0])
-    df.attrs["short_w"] = short_w
-    df.attrs["long_w"] = long_w
-    df.attrs["total_fees"] = total_fees_paid
-
-    return df, buy_signals, sell_signals, final_value
-
-
-def compute_metrics(df, capital):
-    final_val = float(df["portfolio"].iloc[-1])
-    total_return = (final_val - capital) / capital * 100
-    bh_return = (float(df["bh"].iloc[-1]) - capital) / capital * 100
-
-    daily_returns = df["portfolio"].pct_change().dropna()
-
-    if len(daily_returns) > 1 and daily_returns.std() > 0:
-        sharpe = (daily_returns.mean() / daily_returns.std()) * np.sqrt(252)
-    else:
-        sharpe = 0.0
-
-    rolling_max = df["portfolio"].cummax()
-    drawdown = (df["portfolio"] - rolling_max) / rolling_max
-    max_dd = float(drawdown.min()) * 100 if not drawdown.empty else 0.0
-
-    n_trades = int((df["position"] != 0).sum())
-    win_days = int((daily_returns > 0).sum())
-    total_days = int(len(daily_returns))
-    win_rate = (win_days / total_days * 100) if total_days > 0 else 0.0
-
-    confidence = 0.95
-    var_historical = float(np.percentile(daily_returns, (1 - confidence) * 100))
-
-    mu = daily_returns.mean()
-    sigma = daily_returns.std()
-    var_parametric = float(stats.norm.ppf(1 - confidence, mu, sigma))
-
-    var_dollar = var_historical * final_val
-
-    return {
-        "final_val": final_val,
-        "total_return": total_return,
-        "bh_return": bh_return,
-        "sharpe": sharpe,
-        "max_dd": max_dd,
-        "n_trades": n_trades,
-        "win_rate": win_rate,
-        "drawdown": drawdown,
-        "var_historical": var_historical * 100,
-        "var_parametric": var_parametric * 100,
-        "var_dollar": var_dollar,
-        "daily_returns": daily_returns,
-    }
-
-
-def plot_results(df: pd.DataFrame, buy_signals, sell_signals, ticker: str, metrics: dict):
-    fig = make_subplots(
-        rows=3,
-        cols=1,
-        shared_xaxes=True,
-        row_heights=[0.5, 0.3, 0.2],
-        vertical_spacing=0.06,
-        subplot_titles=(
-            f"{ticker} — Prix et moyennes mobiles",
-            "Valeur du portefeuille vs Buy & Hold",
-            "Drawdown"
-        )
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=df.index,
-            y=df["Close"],
-            name="Prix",
-            line=dict(color="#378ADD", width=1.5),
-            hovertemplate="%{x|%d %b %Y}<br>Prix: $%{y:.2f}<extra></extra>"
-        ),
-        row=1,
-        col=1
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=df.index,
-            y=df["SMA_fast"],
-            name=f"SMA {df.attrs.get('short_w', 'rapide')}",
-            line=dict(color="#EF9F27", width=1.5, dash="dot"),
-            hovertemplate="SMA rapide: $%{y:.2f}<extra></extra>"
-        ),
-        row=1,
-        col=1
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=df.index,
-            y=df["SMA_slow"],
-            name=f"SMA {df.attrs.get('long_w', 'lente')}",
-            line=dict(color="#7F77DD", width=1.5),
-            hovertemplate="SMA lente: $%{y:.2f}<extra></extra>"
-        ),
-        row=1,
-        col=1
-    )
-
-    if buy_signals:
-        bx, by = zip(*buy_signals)
-        fig.add_trace(
-            go.Scatter(
-                x=list(bx),
-                y=list(by),
-                mode="markers",
-                name="Achat",
-                marker=dict(color="#1D9E75", size=9, symbol="triangle-up"),
-                hovertemplate="%{x|%d %b %Y}<br>Achat: $%{y:.2f}<extra></extra>"
-            ),
-            row=1,
-            col=1
-        )
-
-    if sell_signals:
-        sx, sy = zip(*sell_signals)
-        fig.add_trace(
-            go.Scatter(
-                x=list(sx),
-                y=list(sy),
-                mode="markers",
-                name="Vente",
-                marker=dict(color="#E24B4A", size=9, symbol="triangle-down"),
-                hovertemplate="%{x|%d %b %Y}<br>Vente: $%{y:.2f}<extra></extra>"
-            ),
-            row=1,
-            col=1
-        )
-
-    fig.add_trace(
-        go.Scatter(
-            x=df.index,
-            y=df["portfolio"],
-            name="Stratégie",
-            line=dict(color="#1D9E75", width=2),
-            hovertemplate="%{x|%d %b %Y}<br>Portefeuille: $%{y:,.0f}<extra></extra>"
-        ),
-        row=2,
-        col=1
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=df.index,
-            y=df["bh"],
-            name="Buy & Hold",
-            line=dict(color="#B4B2A9", width=1.5, dash="dash"),
-            hovertemplate="%{x|%d %b %Y}<br>Buy & Hold: $%{y:,.0f}<extra></extra>"
-        ),
-        row=2,
-        col=1
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=df.index,
-            y=metrics["drawdown"] * 100,
-            name="Drawdown",
-            fill="tozeroy",
-            line=dict(color="#E24B4A", width=1),
-            fillcolor="rgba(226,75,74,0.15)",
-            hovertemplate="%{x|%d %b %Y}<br>Drawdown: %{y:.1f}%<extra></extra>"
-        ),
-        row=3,
-        col=1
-    )
-
-    fig.update_layout(
-        height=760,
-        hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0),
-        margin=dict(t=70, b=30, l=0, r=0),
-        plot_bgcolor="white",
-        paper_bgcolor="white"
-    )
-
-    fig.update_yaxes(tickprefix="$", row=1, col=1, gridcolor="#f0f0f0")
-    fig.update_yaxes(tickprefix="$", tickformat=",.0f", row=2, col=1, gridcolor="#f0f0f0")
-    fig.update_yaxes(ticksuffix="%", row=3, col=1, gridcolor="#f0f0f0")
-    fig.update_xaxes(gridcolor="#f0f0f0")
-
-    return fig
-
-def monte_carlo(df, n_simulations=500, n_days=252):
-    close = df["Close"]
-    daily_returns = close.pct_change().dropna()
-
-    mu = daily_returns.mean()
-    sigma = daily_returns.std()
-    last_price = float(close.iloc[-1])
-
-    dt = 1
-    simulations = np.zeros((n_days, n_simulations))
-
-    for i in range(n_simulations):
-        prices = [last_price]
-        for _ in range(n_days - 1):
-            z = np.random.standard_normal()
-            price = prices[-1] * np.exp((mu - 0.5 * sigma**2) * dt + sigma * np.sqrt(dt) * z)
-            prices.append(price)
-        simulations[:, i] = prices
-
-    percentile_5  = np.percentile(simulations, 5,  axis=1)
-    percentile_25 = np.percentile(simulations, 25, axis=1)
-    percentile_50 = np.percentile(simulations, 50, axis=1)
-    percentile_75 = np.percentile(simulations, 75, axis=1)
-    percentile_95 = np.percentile(simulations, 95, axis=1)
-
-    return simulations, percentile_5, percentile_25, percentile_50, percentile_75, percentile_95, mu, sigma
-
+# Le bouton "run" n'est True que lors du clic. Sans session_state, bouger un
+# slider situé dans les résultats (fenêtres walk-forward, simulations Monte
+# Carlo) relancerait le script avec run=False et ferait disparaître la page.
 if run:
+    st.session_state["backtest_on"] = True
+
+if st.session_state.get("backtest_on"):
     with st.spinner(f"Chargement des données pour {ticker}..."):
         df, load_error = load_data(ticker, start_date, end_date)
 
@@ -377,103 +135,279 @@ if run:
     min_required = sma_long + 10
     if len(df) < min_required:
         st.error(
-            f"Pas assez de données pour calculer correctement la stratégie sur **{ticker}**. "
-            f"{len(df)} lignes chargées, mais il en faut au moins **{min_required}**. "
-            f"Choisis une période plus longue ou réduis la SMA lente."
+            f"Pas assez de données pour {ticker}. "
+            f"{len(df)} lignes chargées, il en faut au moins **{min_required}**."
         )
         st.stop()
 
-    df, buy_signals, sell_signals, final_value = run_backtest(df, sma_short, sma_long, capital, fees)
+    df, buy_signals, sell_signals, final_value, trades = run_backtest(
+        df, sma_short, sma_long, capital, fees, stop_loss_pct, take_profit_pct
+    )
 
     if df is None or df.empty:
-        st.error("Le backtest n’a pas pu être exécuté, car les données après calcul des moyennes mobiles sont insuffisantes.")
+        st.error("Le backtest n'a pas pu être exécuté.")
         st.stop()
 
     metrics = compute_metrics(df, capital)
+    trade_metrics = compute_trade_metrics(trades)
 
-    # Ligne 1
+    # ── Métriques globales ────────────────────────────────────────────────────
     col1, col2, col3, col4 = st.columns(4, gap="large")
-
     col1.metric(
         "Rendement stratégie",
         f"{metrics['total_return']:+.1f}%",
         delta=f"{metrics['total_return'] - metrics['bh_return']:+.1f}% vs B&H"
     )
-
     col2.metric("Buy & Hold", f"{metrics['bh_return']:+.1f}%")
     col3.metric("Ratio de Sharpe", f"{metrics['sharpe']:.2f}")
     col4.metric("Max drawdown", f"{metrics['max_dd']:.1f}%")
 
-    # Espace
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # Ligne 2
-    col5, col6, col7 = st.columns(3, gap="large")
+    col5, col6, col7, col8 = st.columns(4, gap="large")
+    col5.metric("CAGR (annualisé)", f"{metrics['cagr']:+.1f}%")
+    col6.metric("Ratio de Sortino", f"{metrics['sortino']:.2f}")
+    col7.metric("Ratio de Calmar", f"{metrics['calmar']:.2f}")
+    col8.metric("Frais payés", f"${df.attrs.get('total_fees', 0):,.0f}")
 
-    col5.metric("VaR 95% (1j)", f"{metrics['var_historical']:.2f}%")
-    col6.metric("VaR en $", f"${abs(metrics['var_dollar']):,.0f}")
-    col7.metric("Frais payés", f"${df.attrs.get('total_fees', 0):,.0f}")
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    col9, col10, col11 = st.columns(3, gap="large")
+    col9.metric("VaR 95% (1j)", f"{metrics['var_historical']:.2f}%")
+    col10.metric("VaR en $", f"${abs(metrics['var_dollar']):,.0f}")
+    col11.metric("Nb de signaux", metrics["n_trades"])
 
     st.markdown("<br>", unsafe_allow_html=True)
     st.divider()
     st.markdown("<br>", unsafe_allow_html=True)
 
-    fig = plot_results(df, buy_signals, sell_signals, ticker, metrics)
-    st.plotly_chart(fig, use_container_width=True)
+    # ── Graphique principal ───────────────────────────────────────────────────
+    fig = plots.plot_results(df, buy_signals, sell_signals, ticker, metrics)
+    st.plotly_chart(fig, width="stretch")
 
-    st.markdown("<br><br>", unsafe_allow_html=True)
+    # ═════════════════════════════════════════════════════════════════════════
+    # SECTION 1 : ANALYSE TRADE PAR TRADE
+    # ═════════════════════════════════════════════════════════════════════════
+    st.markdown("<br>", unsafe_allow_html=True)
     st.divider()
     st.markdown("<br>", unsafe_allow_html=True)
+    st.subheader("📋 Analyse trade par trade")
 
+    if not trades:
+        st.info("Aucun trade exécuté sur cette période avec ces paramètres.")
+    else:
+        # ── Métriques résumées par trade ──────────────────────────────────────
+        if trade_metrics:
+            tc1, tc2, tc3, tc4, tc5, tc6 = st.columns(6, gap="small")
+            tc1.metric("Trades complétés", trade_metrics["nb_trades"])
+            tc2.metric("Win rate", f"{trade_metrics['win_rate']:.1f}%")
+            tc3.metric("Gain moyen", f"{trade_metrics['avg_win']:+.2f}%")
+            tc4.metric("Perte moyenne", f"{trade_metrics['avg_loss']:+.2f}%")
+            tc5.metric("Profit factor",
+                       f"{trade_metrics['profit_factor']:.2f}" if trade_metrics['profit_factor'] != float('inf') else "∞")
+            tc6.metric("Durée moy.", f"{trade_metrics['avg_duration']:.0f}j")
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            bc1, bc2 = st.columns(2, gap="large")
+            bc1.metric("Meilleur trade", f"{trade_metrics['best_trade']:+.2f}%")
+            bc2.metric("Pire trade", f"{trade_metrics['worst_trade']:+.2f}%")
+
+        # ── Bar chart des rendements ──────────────────────────────────────────
+        st.markdown("<br>", unsafe_allow_html=True)
+        fig_trades = plots.plot_trade_returns(trades)
+        if fig_trades:
+            st.plotly_chart(fig_trades, width="stretch")
+
+        # ── Tableau détaillé ──────────────────────────────────────────────────
+        with st.expander("📊 Voir le détail de tous les trades"):
+            df_trades = pd.DataFrame(trades).copy()
+            df_trades["Entrée"] = pd.to_datetime(df_trades["Entrée"]).dt.strftime("%d/%m/%Y")
+            df_trades["Sortie"] = pd.to_datetime(df_trades["Sortie"]).dt.strftime("%d/%m/%Y")
+
+            def color_return(val):
+                if isinstance(val, (int, float)):
+                    color = "#1D9E75" if val > 0 else ("#E24B4A" if val < 0 else "#888")
+                    return f"color: {color}; font-weight: bold"
+                return ""
+
+            st.dataframe(
+                df_trades.style
+                .map(color_return, subset=["Rendement (%)", "P&L ($)"])
+                .format({
+                    "Prix entrée ($)": "${:.2f}",
+                    "Prix sortie ($)": "${:.2f}",
+                    "Rendement (%)": "{:+.2f}%",
+                    "P&L ($)": "${:+,.2f}",
+                    "Durée (j)": "{:.0f}j",
+                }),
+                width="stretch",
+                hide_index=True
+            )
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # SECTION 2 : WALK-FORWARD ANALYSIS
+    # ═════════════════════════════════════════════════════════════════════════
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.divider()
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.subheader("🔄 Walk-Forward Analysis")
+    st.markdown("""
+    > **Concept clé** : un backtest sur une seule période peut être trompeur — la stratégie a peut-être
+    > bien fonctionné *par chance* sur ce marché précis. Le walk-forward découpe les données en plusieurs
+    > fenêtres indépendantes et mesure la **cohérence des performances dans le temps**.
+    > Si la stratégie est robuste, elle devrait être profitable (ou au moins cohérente) sur la majorité des fenêtres.
+    """)
+
+    n_windows = st.slider("Nombre de fenêtres temporelles", min_value=2, max_value=10, value=4, step=1)
+
+    with st.spinner("Calcul du walk-forward..."):
+        wf_df, wf_error = walk_forward_analysis(
+            df, sma_short, sma_long, capital, fees,
+            stop_loss_pct, take_profit_pct,
+            n_windows=n_windows
+        )
+
+    if wf_error:
+        st.warning(wf_error)
+    else:
+        # ── Graphique walk-forward ────────────────────────────────────────────
+        fig_wf = plots.plot_walk_forward(wf_df)
+        st.plotly_chart(fig_wf, width="stretch")
+
+        # ── Indicateur de robustesse ──────────────────────────────────────────
+        n_beating_bh = int(np.sum(wf_df["Rdt strategie (%)"] > wf_df["Rdt B&H (%)"]))
+        n_positive = int(np.sum(wf_df["Rdt strategie (%)"] > 0))
+        total_w = len(wf_df)
+
+        rob1, rob2, rob3 = st.columns(3, gap="large")
+        rob1.metric(
+            "Fenêtres > B&H",
+            f"{n_beating_bh}/{total_w}",
+            delta="robuste" if n_beating_bh >= total_w * 0.6 else "fragile"
+        )
+        rob2.metric(
+            "Fenêtres positives",
+            f"{n_positive}/{total_w}",
+            delta="OK" if n_positive >= total_w * 0.6 else "à surveiller"
+        )
+        rob3.metric(
+            "Sharpe moyen",
+            f"{wf_df['Sharpe'].mean():.2f}"
+        )
+
+        # ── Tableau récapitulatif ─────────────────────────────────────────────
+        with st.expander("📊 Tableau détaillé des fenêtres"):
+            st.dataframe(
+                wf_df.style.format({
+                    "Rdt strategie (%)": "{:+.2f}%",
+                    "Rdt B&H (%)": "{:+.2f}%",
+                    "Sharpe": "{:.2f}",
+                    "Max DD (%)": "{:.2f}%",
+                    "Win rate (%)": "{:.1f}%",
+                }),
+                width="stretch",
+                hide_index=True
+            )
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # SECTION 3 : OPTIMISATION DES PARAMÈTRES (GRID SEARCH)
+    # ═════════════════════════════════════════════════════════════════════════
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.divider()
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.subheader("🗺️ Optimisation des paramètres")
+    st.markdown("""
+    > **Concept clé** : la heatmap teste toutes les combinaisons de SMA et colore chaque case
+    > selon la performance. Une stratégie robuste montre une **zone** de bons paramètres
+    > (un plateau vert) ; un **pic isolé** entouré de rouge est presque toujours de
+    > l'overfitting — du bruit statistique qu'il ne faut pas trader.
+    """)
+
+    opt_c1, opt_c2 = st.columns(2)
+    with opt_c1:
+        resolution = st.radio(
+            "Résolution de la grille",
+            ["Grossière (~100 backtests, rapide)", "Fine (~300 backtests, plus lent)"],
+        )
+    with opt_c2:
+        metric_options = {
+            "Ratio de Sharpe": ("sharpe", "Sharpe"),
+            "Rendement total (%)": ("total_return", "Rendement (%)"),
+            "Ratio de Calmar": ("calmar", "Calmar"),
+        }
+        metric_choice = st.selectbox("Métrique à optimiser", list(metric_options.keys()))
+        metric_col, metric_label = metric_options[metric_choice]
+
+    if st.button("Lancer l'optimisation"):
+        st.session_state["opt_on"] = True
+
+    if st.session_state.get("opt_on"):
+        if resolution.startswith("Grossière"):
+            fast_values = tuple(range(5, 61, 5))
+            slow_values = tuple(range(20, 201, 20))
+        else:
+            fast_values = tuple(range(5, 61, 3))
+            slow_values = tuple(range(20, 201, 10))
+
+        raw_df = load_data(ticker, start_date, end_date)[0]
+
+        progress = st.progress(0.0, text="Grid search en cours...")
+        grid_df = run_grid_search(
+            raw_df, fast_values, slow_values, capital, fees,
+            stop_loss_pct, take_profit_pct,
+            _progress=lambda p: progress.progress(p, text=f"Grid search... {int(p * 100)}%")
+        )
+        progress.empty()
+
+        if grid_df is None or grid_df.empty:
+            st.warning("Aucune combinaison n'a pu être testée (période trop courte ?).")
+        else:
+            best_row = grid_df.loc[grid_df[metric_col].idxmax()]
+            best_fast, best_slow = int(best_row["fast"]), int(best_row["slow"])
+
+            fig_opt = plots.plot_optimization_heatmap(
+                grid_df, metric_col, metric_label,
+                current=(sma_short, sma_long),
+                best=(best_fast, best_slow),
+            )
+            st.plotly_chart(fig_opt, width="stretch")
+
+            current_value = {
+                "sharpe": metrics["sharpe"],
+                "total_return": metrics["total_return"],
+                "calmar": metrics["calmar"],
+            }[metric_col]
+
+            oc1, oc2, oc3 = st.columns(3, gap="large")
+            oc1.metric("Meilleure combinaison", f"SMA {best_fast} / {best_slow}")
+            oc2.metric(f"{metric_label} optimal", f"{best_row[metric_col]:.2f}")
+            oc3.metric(
+                f"{metric_label} actuel (SMA {sma_short}/{sma_long})",
+                f"{current_value:.2f}",
+                delta=f"{current_value - best_row[metric_col]:+.2f} vs optimal"
+            )
+
+            st.caption(
+                "⚠️ La meilleure combinaison sur le passé n'est pas une garantie pour le futur. "
+                "Vérifie qu'elle se trouve dans une zone stable de la carte, puis valide-la avec "
+                "le walk-forward. Le grid search utilise les mêmes frais et stop-loss/take-profit "
+                "que le backtest principal."
+            )
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # DISTRIBUTION DES RENDEMENTS + VaR
+    # ═════════════════════════════════════════════════════════════════════════
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.divider()
+    st.markdown("<br>", unsafe_allow_html=True)
     st.subheader("Distribution des rendements journaliers")
 
-    fig_var = go.Figure()
+    fig_var = plots.plot_return_distribution(metrics)
+    st.plotly_chart(fig_var, width="stretch")
 
-    fig_var.add_trace(go.Histogram(
-        x=metrics["daily_returns"] * 100,
-        nbinsx=60,
-        name="Rendements",
-        marker=dict(color="#378ADD"),
-        opacity=0.7
-    ))
-
-    var_line = metrics["var_historical"]
-    fig_var.add_vline(
-        x=var_line,
-        line_dash="dash",
-        line_color="#E24B4A",
-        line_width=2,
-        annotation_text=f"VaR 95% = {var_line:.2f}%",
-        annotation_position="top right"
-    )
-
-    fig_var.add_vline(
-        x=metrics["var_parametric"],
-        line_dash="dot",
-        line_color="#7F77DD",
-        line_width=2,
-        annotation_text=f"VaR paramétrique = {metrics['var_parametric']:.2f}%",
-        annotation_position="top left"
-    )
-
-    fig_var.update_layout(
-        height=360,
-        margin=dict(t=50, b=30, l=0, r=0),
-        plot_bgcolor="white",
-        paper_bgcolor="white",
-        xaxis_title="Rendement journalier (%)",
-        yaxis_title="Fréquence",
-        showlegend=False
-    )
-    fig_var.update_xaxes(gridcolor="#f0f0f0")
-    fig_var.update_yaxes(gridcolor="#f0f0f0")
-
-    st.plotly_chart(fig_var, use_container_width=True)
-
+    # ── Données brutes ────────────────────────────────────────────────────────
     st.markdown("<br>", unsafe_allow_html=True)
-    st.divider()
-    st.markdown("<br>", unsafe_allow_html=True)
-
     with st.expander("Voir les données brutes"):
         st.dataframe(
             df[["Close", "SMA_fast", "SMA_slow", "portfolio", "bh"]]
@@ -485,9 +419,15 @@ if run:
                 "portfolio": "${:,.0f}",
                 "bh": "${:,.0f}"
             }),
-            use_container_width=True
+            width="stretch"
         )
 
+    # ═════════════════════════════════════════════════════════════════════════
+    # MONTE CARLO
+    # ═════════════════════════════════════════════════════════════════════════
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.divider()
+    st.markdown("<br>", unsafe_allow_html=True)
     st.subheader("Simulation Monte Carlo — projections sur 1 an")
 
     n_sims = st.slider("Nombre de simulations", min_value=100, max_value=1000, value=500, step=100)
@@ -495,86 +435,14 @@ if run:
     with st.spinner("Calcul des simulations..."):
         sims, p5, p25, p50, p75, p95, mu_mc, sigma_mc = monte_carlo(
             load_data(ticker, start_date, end_date)[0],
-            n_simulations=n_sims,
-            n_days=252
+            n_simulations=n_sims, n_days=252
         )
 
-    future_days = list(range(252))
     last_price = float(df["Close"].iloc[-1])
 
-    fig_mc = go.Figure()
+    fig_mc = plots.plot_monte_carlo(sims, p5, p25, p50, p75, p95)
+    st.plotly_chart(fig_mc, width="stretch")
 
-    # Bande 5%-95% (zone grise large)
-    fig_mc.add_trace(go.Scatter(
-        x=future_days + future_days[::-1],
-        y=list(p95) + list(p5[::-1]),
-        fill="toself",
-        fillcolor="rgba(55, 138, 221, 0.08)",
-        line=dict(color="rgba(0,0,0,0)"),
-        name="Intervalle 90%",
-        hoverinfo="skip"
-    ))
-
-    # Bande 25%-75% (zone bleue plus foncée)
-    fig_mc.add_trace(go.Scatter(
-        x=future_days + future_days[::-1],
-        y=list(p75) + list(p25[::-1]),
-        fill="toself",
-        fillcolor="rgba(55, 138, 221, 0.18)",
-        line=dict(color="rgba(0,0,0,0)"),
-        name="Intervalle 50%",
-        hoverinfo="skip"
-    ))
-
-    # Quelques trajectoires individuelles
-    for i in range(min(50, n_sims)):
-        fig_mc.add_trace(go.Scatter(
-            x=future_days,
-            y=sims[:, i],
-            line=dict(color="rgba(55, 138, 221, 0.08)", width=1),
-            showlegend=False,
-            hoverinfo="skip"
-        ))
-
-    # Médiane
-    fig_mc.add_trace(go.Scatter(
-        x=future_days,
-        y=p50,
-        line=dict(color="#378ADD", width=2),
-        name="Médiane",
-        hovertemplate="Jour %{x}<br>Prix médian: $%{y:.2f}<extra></extra>"
-    ))
-
-    # P5 et P95
-    fig_mc.add_trace(go.Scatter(
-        x=future_days, y=p95,
-        line=dict(color="#1D9E75", width=1.5, dash="dash"),
-        name="95e percentile",
-        hovertemplate="Jour %{x}<br>P95: $%{y:.2f}<extra></extra>"
-    ))
-    fig_mc.add_trace(go.Scatter(
-        x=future_days, y=p5,
-        line=dict(color="#E24B4A", width=1.5, dash="dash"),
-        name="5e percentile",
-        hovertemplate="Jour %{x}<br>P5: $%{y:.2f}<extra></extra>"
-    ))
-
-    fig_mc.update_layout(
-        height=400,
-        hovermode="x unified",
-        margin=dict(t=20, b=20, l=0, r=0),
-        plot_bgcolor="white",
-        paper_bgcolor="white",
-        yaxis_title="Prix ($)",
-        xaxis_title="Jours dans le futur",
-        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0)
-    )
-    fig_mc.update_xaxes(gridcolor="#f0f0f0")
-    fig_mc.update_yaxes(tickprefix="$", gridcolor="#f0f0f0")
-
-    st.plotly_chart(fig_mc, use_container_width=True)
-
-    # Métriques Monte Carlo
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Prix actuel", f"${last_price:.2f}")
     col2.metric("Prix médian dans 1 an", f"${p50[-1]:.2f}",
@@ -585,9 +453,8 @@ if run:
                 delta=f"{(p95[-1] / last_price - 1) * 100:+.1f}%")
 
     st.caption(
-        f"Paramètres estimés sur données historiques — "
-        f"rendement journalier moyen : {mu_mc * 100:.3f}%, "
-        f"volatilité journalière : {sigma_mc * 100:.3f}% "
+        f"Rendement journalier moyen : {mu_mc * 100:.3f}% — "
+        f"Volatilité journalière : {sigma_mc * 100:.3f}% "
         f"({sigma_mc * np.sqrt(252) * 100:.1f}% annualisée)"
     )
 
@@ -601,9 +468,29 @@ else:
     - **Achat (golden cross)** : quand la SMA rapide passe au-dessus de la SMA lente → signal haussier
     - **Vente (death cross)** : quand la SMA rapide repasse en dessous → signal baissier
 
+    **Exécution réaliste :** le croisement est détecté sur la clôture du jour t,
+    mais le trade est exécuté au jour **t+1** — sinon on utiliserait une information
+    qu'on ne pouvait pas connaître au moment de trader (*look-ahead bias*, le piège n°1 des backtests).
+
     **Métriques calculées :**
     - **Rendement total** : performance de la stratégie vs Buy & Hold
+    - **CAGR** : rendement annualisé composé — comparable entre périodes différentes
     - **Ratio de Sharpe** : rendement ajusté au risque (> 1 = bon, > 2 = excellent)
+    - **Ratio de Sortino** : comme Sharpe, mais ne pénalise que la volatilité à la baisse
+    - **Ratio de Calmar** : CAGR / max drawdown — le "coût en douleur" du rendement
     - **Max drawdown** : perte maximale depuis un sommet
-    - **Nombre de trades** : nombre de signaux générés
+    - **Win rate (par trade)** : % de trades profitables
+    - **Profit factor** : ratio gains bruts / pertes brutes (> 1 = profitable)
+
+    **Gestion du risque :**
+    - **Stop-Loss** : ferme automatiquement la position si le prix baisse trop depuis l'entrée
+    - **Take-Profit** : sécurise les gains si le prix monte suffisamment
+
+    **Walk-Forward Analysis :**
+    - Divise la période en N fenêtres indépendantes
+    - Vérifie si la stratégie est **robuste dans le temps** ou juste chanceuse sur une période donnée
+
+    **Optimisation des paramètres (grid search) :**
+    - Teste toutes les combinaisons de SMA et affiche une **heatmap** de performance
+    - Une **zone stable** de bons paramètres = robustesse ; un **pic isolé** = overfitting
     """)
