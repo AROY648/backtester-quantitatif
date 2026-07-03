@@ -16,7 +16,7 @@ Teste des stratégies *momentum* et *mean-reversion* sur données de marché ré
 
 ---
 
-## 📋 Sommaire
+## Sommaire
 
 - [Aperçu](#-aperçu)
 - [Fonctionnalités](#-fonctionnalités)
@@ -29,17 +29,17 @@ Teste des stratégies *momentum* et *mean-reversion* sur données de marché ré
 
 ---
 
-## 🎯 Aperçu
+##Aperçu
 
 Ce projet simule l'application de règles de trading précises sur l'historique boursier, puis mesure **objectivement** leur performance et leur risque. Il illustre une démarche quantitative complète : de la génération de signaux jusqu'à la validation statistique d'une stratégie — en insistant sur les pièges qui rendent la plupart des backtests trompeurs (*look-ahead bias*, *overfitting*).
 
 ---
 
-## ✨ Fonctionnalités
+##Fonctionnalités
 
 ### Deux stratégies aux philosophies opposées
-- **📈 Momentum — Croisement de moyennes mobiles (SMA)** : suit la tendance (golden cross / death cross)
-- **📉 Mean-Reversion — RSI** : parie sur le retour à la moyenne (achat en survente, vente en surachat)
+- **Momentum — Croisement de moyennes mobiles (SMA)** : suit la tendance (golden cross / death cross)
+- **Mean-Reversion — RSI** : parie sur le retour à la moyenne (achat en survente, vente en surachat)
 
 ### Moteur de backtest réaliste
 - **Frais de transaction** appliqués à chaque trade
@@ -53,13 +53,13 @@ Ce projet simule l'application de règles de trading précises sur l'historique 
 - **Analyse trade par trade** : win rate, profit factor, durée moyenne, P&L individuel
 
 ### Validation de robustesse
-- **🔄 Walk-Forward Analysis** : découpe la période en fenêtres indépendantes pour tester la cohérence dans le temps
-- **🗺️ Optimisation par grid search** avec heatmap : visualise la sensibilité aux paramètres pour distinguer une vraie stratégie d'un cas d'overfitting
-- **🎲 Simulation Monte Carlo** : projette des milliers de trajectoires de prix pour cadrer l'incertitude future
+- **Walk-Forward Analysis** : découpe la période en fenêtres indépendantes pour tester la cohérence dans le temps
+- **Optimisation par grid search** avec heatmap : visualise la sensibilité aux paramètres pour distinguer une vraie stratégie d'un cas d'overfitting
+- **Simulation Monte Carlo** : projette des milliers de trajectoires de prix pour cadrer l'incertitude future
 
 ---
 
-## 🏗️ Architecture
+## Architecture
 
 Le projet sépare nettement **la logique métier** (testable sans interface) de **l'affichage**.
 
@@ -102,7 +102,7 @@ print(compute_metrics(df, 10_000)["sharpe"])
 
 ---
 
-## 🚀 Installation
+## Installation
 
 ```bash
 git clone https://github.com/AROY648/backtester-quantitatif
@@ -115,14 +115,14 @@ L'application s'ouvre sur `http://localhost:8501`.
 
 ---
 
-## 📖 Utilisation
+## Utilisation
 
 1. Choisis une **stratégie** et un **ticker** (ex : `SPY`, `AAPL`, `TSLA`) dans la barre latérale
 2. Règle les paramètres, les frais, et optionnellement un stop-loss / take-profit
 3. Clique sur **Lancer le backtest**
 4. Analyse : performance vs Buy & Hold, trades individuels, robustesse walk-forward, heatmap d'optimisation, projections Monte Carlo
 
-> 💡 **Expérience recommandée** : lance la *même* action avec les deux stratégies. Elles performent dans des **régimes de marché opposés** — le momentum dans les tendances, le mean-reversion dans les marchés en range. Aucune ne gagne partout : c'est le fondement de la diversification de stratégies.
+> **Expérience recommandée** : lance la *même* action avec les deux stratégies. Elles performent dans des **régimes de marché opposés** — le momentum dans les tendances, le mean-reversion dans les marchés en range. Aucune ne gagne partout : c'est le fondement de la diversification de stratégies.
 
 ---
 
@@ -153,12 +153,6 @@ L'application s'ouvre sur `http://localhost:8501`.
 - **SciPy** — statistiques (VaR paramétrique)
 - **Plotly** — visualisations interactives
 - **yfinance** — données de marché (Yahoo Finance)
-
----
-
-## ⚠️ Avertissement
-
-Ce projet est un outil **éducatif** d'analyse historique. Les performances passées ne préjugent pas des performances futures. Il ne constitue en aucun cas un conseil en investissement.
 
 ---
 
